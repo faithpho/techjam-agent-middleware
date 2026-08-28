@@ -55,7 +55,7 @@ export class AgentService {
   getAgent(id: string): Agent {
     const agent = this.store.snapshot().agents.find((item) => item.id === id);
     if (!agent) {
-      throw new HttpError(404, "Agent not found");
+      throw new HttpError(404, " Agent not found");
     }
     return agent;
   }
@@ -125,6 +125,35 @@ export class AgentService {
     await this.cancelExecution(id);
     return this.setStatus(id, "stopped");
   }
+  // ---- NEW: approve/deny methods go here ----
+  async approveRun(runId: string): Promise<void> {
+  const run = this.getRun(runId);
+  if (run.status !== "pending_approval") {
+    throw new HttpError(409, "This run is not pending approval");
+  }
+  const agent = this.getAgent(run.agentId);
+  const execution = this.executeRun(agent, run);
+  this.activeExecutions.set(agent.id, execution);
+  void execution.finally(() => {
+    if (this.activeExecutions.get(agent.id) === execution) {
+      this.activeExecutions.delete(agent.id);
+    }
+  }).catch(() => undefined);
+}
+  async denyRun(runId: string): Promise<void> {
+    await this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === runId);
+      const agent = database.agents.find((item) => item.id === storedRun?.agentId);
+      if (storedRun) {
+        storedRun.status = "denied";
+        storedRun.completedAt = now();
+      }
+      if (agent) {
+        agent.status = "ready";
+      }
+    });
+  }
+  // ---- end new methods ----
 
   getMessages(agentId: string): Message[] {
     this.getAgent(agentId);
@@ -201,6 +230,20 @@ export class AgentService {
       storedAgent.updatedAt = timestamp;
       return snapshot;
     });
+    // NEW: check risk before running
+    const riskReason = this.getRiskReason(run.prompt);
+    if (riskReason) {
+      await this.store.mutate((database) => {
+        const storedRun = database.runs.find((item) => item.id === run.id);
+        if (storedRun) {
+          storedRun.status = "pending_approval";  // new status
+          storedRun.riskReason = riskReason;
+        }
+      });
+      run.status = "pending_approval"; // NEW: fix the local copy too
+      run.riskReason = riskReason;      // NEW
+      return { run, message }; // stop here — do NOT call executeRun yet
+    }
     const execution = this.executeRun(agentAtStart, run);
     this.activeExecutions.set(agentId, execution);
     void execution
@@ -323,4 +366,18 @@ export class AgentService {
       this.cancellationRequests.delete(agentId);
     }
   }
+  // ---- NEW: risk-check helper goes here ----
+  private getRiskReason(prompt: string): string | null {
+  const riskyPatterns: Array<{ pattern: RegExp; label: string }> = [
+    { pattern: /rm\s+-rf/i, label: "destructive shell command (rm -rf)" },
+    { pattern: /delete/i, label: "delete action" },
+    { pattern: /drop\s+table/i, label: "database drop command" },
+    { pattern: /\.env/i, label: "environment/secrets file access" },
+    { pattern: /credentials/i, label: "credentials reference" },
+    { pattern: /secret/i, label: "secret reference" },
+  ];
+  const match = riskyPatterns.find(({ pattern }) => pattern.test(prompt));
+  return match ? match.label : null;
 }
+} // <- this is the class's final closing brace
+

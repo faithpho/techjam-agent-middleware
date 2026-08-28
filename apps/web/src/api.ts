@@ -78,4 +78,12 @@ export const api = {
       },
     ),
   run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
+  approveRun: (id: string) =>
+    request<{ ok: boolean }>("/api/runs/" + id + "/approve", {
+      method: "POST",
+    }),
+  denyRun: (id: string) =>
+    request<{ ok: boolean }>("/api/runs/" + id + "/deny", {
+      method: "POST",
+    }),
 };

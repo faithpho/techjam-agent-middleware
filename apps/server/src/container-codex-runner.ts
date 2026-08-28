@@ -27,6 +27,7 @@ interface ParsedEvents {
   threadId: string | null;
   usage: RunUsage | null;
   errors: string[];
+  blockedCommand: string | null; // NEW
 }
 
 export function containerName(agentId: string, instanceId = "default"): string {
@@ -171,6 +172,7 @@ export class ContainerCodexRunner implements AgentRunner {
       threadId: request.threadId,
       usage: null,
       errors: [],
+      blockedCommand: null, // NEW — add this line
     };
     let stdout = "";
     let stderr = "";

@@ -11,12 +11,18 @@ import type {
 } from "./types.js";
 
 const execFileAsync = promisify(execFile);
+const RISKY_COMMAND_PATTERNS = [/rm\s+-rf/i, /drop\s+table/i, /:\(\)\{.*:\|:&\};:/]; // fork bomb example
+
+function isCommandRisky(command: string): boolean {
+  return RISKY_COMMAND_PATTERNS.some((pattern) => pattern.test(command));
+}
 
 export interface ParsedEvents {
   messages: string[];
   threadId: string | null;
   usage: RunUsage | null;
   errors: string[];
+  blockedCommand: string | null; // NEW
 }
 
 export function buildCodexArgs(
@@ -42,6 +48,7 @@ export function buildCodexArgs(
 }
 
 export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
+  console.log("RAW CODEX EVENT:", line); // TEMPORARY DEBUG LINE
   let event: Record<string, unknown>;
   try {
     event = JSON.parse(line) as Record<string, unknown>;
@@ -74,7 +81,14 @@ export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
         : {}),
     };
   }
-
+  if (event.type === "item.started" && event.item && typeof event.item === "object") {
+  const item = event.item as Record<string, unknown>;
+  if (item.type === "command_execution" && typeof item.command === "string") {
+    if (isCommandRisky(item.command)) {
+      parsed.blockedCommand = item.command;
+    }
+  }
+}
   if (event.type === "error") {
     const message =
       typeof event.message === "string"
@@ -154,6 +168,7 @@ export class CodexRunner implements AgentRunner {
       threadId: request.threadId,
       usage: null,
       errors: [],
+      blockedCommand: null, // NEW
     };
     let stdout = "";
     let stderr = "";
@@ -167,13 +182,17 @@ export class CodexRunner implements AgentRunner {
         return;
       }
       if (target === "stdout") {
-        stdout += chunk.toString("utf8");
-        const lines = stdout.split(/\r?\n/);
-        stdout = lines.pop() ?? "";
-        for (const line of lines) {
-          parseCodexEventLine(line, parsed);
-        }
-      } else {
+  stdout += chunk.toString("utf8");
+  const lines = stdout.split(/\r?\n/);
+  stdout = lines.pop() ?? "";
+  for (const line of lines) {
+    parseCodexEventLine(line, parsed);
+    if (parsed.blockedCommand && !active.cancelled) {
+      active.cancelled = true; // reuse existing cancellation flag
+      this.terminate(active);
+    }
+  }
+}   else {
         stderr += chunk.toString("utf8");
         if (stderr.length > 16_384) {
           stderr = stderr.slice(-16_384);
@@ -199,6 +218,9 @@ export class CodexRunner implements AgentRunner {
         parseCodexEventLine(stdout.trim(), parsed);
       }
       if (active.cancelled) {
+        if (parsed.blockedCommand) {
+          throw new Error("Blocked risky command mid-execution: " + parsed.blockedCommand);
+        }
         throw new RunCancelledError();
       }
       if (active.timedOut) {

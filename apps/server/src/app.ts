@@ -127,6 +127,18 @@ export async function createApp(
     const { id } = runIdParams.parse(request.params);
     return { run: service.getRun(id) };
   });
+  
+  app.post("/api/runs/:id/approve", async (request, reply) => {
+    const { id } = runIdParams.parse(request.params);
+    await service.approveRun(id);
+    reply.send({ ok: true });
+  });
+
+  app.post("/api/runs/:id/deny", async (request, reply) => {
+    const { id } = runIdParams.parse(request.params);
+    await service.denyRun(id);
+    reply.send({ ok: true });
+  });
 
   if (config.nodeEnv === "production") {
     const webRoot = fileURLToPath(new URL("../../web/dist", import.meta.url));

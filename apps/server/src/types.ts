@@ -1,5 +1,12 @@
 export type AgentStatus = "ready" | "busy" | "stopped" | "error";
-export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type RunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "pending_approval"
+  | "denied";
 export type MessageRole = "user" | "assistant";
 
 export interface Agent {
@@ -41,6 +48,7 @@ export interface AgentRun {
   startedAt: string | null;
   completedAt: string | null;
   createdAt: string;
+  riskReason?: string | null; // NEW: why this run was flagged, if it was
 }
 
 export interface Database {

@@ -1,5 +1,12 @@
 export type AgentStatus = "ready" | "busy" | "stopped" | "error";
-export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type RunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "pending_approval"
+  | "denied";
 
 export interface Agent {
   id: string;
@@ -36,6 +43,7 @@ export interface AgentRun {
     outputTokens?: number;
   } | null;
   createdAt: string;
+  riskReason?: string | null;
 }
 
 export interface SystemInfo {

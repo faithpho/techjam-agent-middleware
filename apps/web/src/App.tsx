@@ -220,6 +220,39 @@ export default function App() {
     }
   };
 
+  const approveRun = async (runId: string) => {
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.approveRun(runId);
+      setAgents((current) =>
+        current.map((agent) =>
+          agent.id === selected.id ? { ...agent, status: "busy" } : agent,
+        ),
+      );
+      await pollRun(runId, selected.id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const denyRun = async (runId: string) => {
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.denyRun(runId);
+      setActiveRun(null);
+      await refreshAgents();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
   const sendMessage = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!selected || !prompt.trim()) return;
@@ -232,11 +265,14 @@ export default function App() {
         setMessages((current) => [...current, result.message]);
         setActiveRun(result.run);
       }
-      setAgents((current) =>
-        current.map((agent) =>
-          agent.id === selected.id ? { ...agent, status: "busy" } : agent,
-        ),
-      );
+      if (result.run.status !== "pending_approval") {
+        setAgents((current) =>
+          current.map((agent) =>
+            agent.id === selected.id ? { ...agent, status: "busy" } : agent,
+          ),
+        );
+        await pollRun(result.run.id, selected.id);
+      }
       await pollRun(result.run.id, selected.id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -529,6 +565,28 @@ export default function App() {
                     <div className="thinking-row">
                       <Spinner />
                       Codex is reading, editing, or running commands…
+                    </div>
+                  </article>
+                )}
+                {activeRun?.status === "pending_approval" && (
+                  <article className="run-error" style={{ borderColor: "#e0a800" }}>
+                    <strong>⏳ Approval needed</strong>
+                    <span>Flagged: {activeRun.riskReason}</span>
+                    <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+                      <button
+                        className="button button-primary"
+                        onClick={() => approveRun(activeRun.id)}
+                        disabled={busy}
+                      >
+                        Approve
+                      </button>
+                      <button
+                        className="button button-danger"
+                        onClick={() => denyRun(activeRun.id)}
+                        disabled={busy}
+                      >
+                        Deny
+                      </button>
                     </div>
                   </article>
                 )}
