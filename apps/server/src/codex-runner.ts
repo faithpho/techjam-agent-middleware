@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
+import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { RunCancelledError } from "./errors.js";
 import type {
@@ -8,13 +9,32 @@ import type {
   RunUsage,
   RunnerRequest,
   RunnerResult,
+  RunSpan,
 } from "./types.js";
+import { redact } from "./redaction.js";
 
 const execFileAsync = promisify(execFile);
-const RISKY_COMMAND_PATTERNS = [/rm\s+-rf/i, /drop\s+table/i, /:\(\)\{.*:\|:&\};:/]; // fork bomb example
+
+const RISKY_COMMAND_PATTERNS = [
+  /\brm\b/i,
+  /\bunlink\b/i,
+  /find\s+.*-delete/i,
+  /find\s+.*-exec\s+rm/i,
+  /drop\s+table/i,
+  /truncate\s+-s\s*0/i,
+  /shred\b/i,
+  />\s*\/dev\/null.*&&.*rm/i,
+  /:\(\)\{.*:\|:&\};:/,
+];
 
 function isCommandRisky(command: string): boolean {
   return RISKY_COMMAND_PATTERNS.some((pattern) => pattern.test(command));
+}
+
+export class CodexRunError extends Error {
+  constructor(message: string, public readonly spans: RunSpan[] = []) {
+    super(message);
+  }
 }
 
 export interface ParsedEvents {
@@ -22,7 +42,8 @@ export interface ParsedEvents {
   threadId: string | null;
   usage: RunUsage | null;
   errors: string[];
-  blockedCommand: string | null; // NEW
+  blockedCommand: string | null;
+  spans: RunSpan[];
 }
 
 export function buildCodexArgs(
@@ -48,7 +69,6 @@ export function buildCodexArgs(
 }
 
 export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
-  console.log("RAW CODEX EVENT:", line); // TEMPORARY DEBUG LINE
   let event: Record<string, unknown>;
   try {
     event = JSON.parse(line) as Record<string, unknown>;
@@ -60,35 +80,62 @@ export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
     parsed.threadId = event.thread_id;
   }
 
+  if (event.type === "item.started" && event.item && typeof event.item === "object") {
+    const item = event.item as Record<string, unknown>;
+    if (item.type === "command_execution" && typeof item.command === "string") {
+      const spanId = typeof item.id === "string" ? item.id : randomUUID();
+      parsed.spans.push({
+        id: spanId,
+        category: "tool_call",
+        label: "Shell command",
+        detail: redact(item.command),
+        status: "in_progress",
+        createdAt: new Date().toISOString(),
+      });
+      if (isCommandRisky(item.command)) {
+        parsed.blockedCommand = item.command;
+      }
+    }
+  }
+
   if (event.type === "item.completed" && event.item && typeof event.item === "object") {
     const item = event.item as Record<string, unknown>;
     if (item.type === "agent_message" && typeof item.text === "string") {
       parsed.messages.push(item.text);
+    }
+    if (item.type === "command_execution" && typeof item.id === "string") {
+      const span = parsed.spans.find((s) => s.id === item.id);
+      if (span) {
+        const exitCode = typeof item.exit_code === "number" ? item.exit_code : null;
+        span.status = exitCode === 0 ? "completed" : "failed";
+        const output = typeof item.aggregated_output === "string" ? item.aggregated_output : "";
+        span.detail = redact((span.detail ?? "") + (output ? " → " + output : ""));
+      }
     }
   }
 
   if (event.type === "turn.completed" && event.usage && typeof event.usage === "object") {
     const usage = event.usage as Record<string, unknown>;
     parsed.usage = {
-      ...(typeof usage.input_tokens === "number"
-        ? { inputTokens: usage.input_tokens }
-        : {}),
+      ...(typeof usage.input_tokens === "number" ? { inputTokens: usage.input_tokens } : {}),
       ...(typeof usage.cached_input_tokens === "number"
         ? { cachedInputTokens: usage.cached_input_tokens }
         : {}),
-      ...(typeof usage.output_tokens === "number"
-        ? { outputTokens: usage.output_tokens }
-        : {}),
+      ...(typeof usage.output_tokens === "number" ? { outputTokens: usage.output_tokens } : {}),
     };
+    parsed.spans.push({
+      id: randomUUID(),
+      category: "model_call",
+      label: "Model turn",
+      detail:
+        "input=" + (parsed.usage?.inputTokens ?? 0) +
+        " cached=" + (parsed.usage?.cachedInputTokens ?? 0) +
+        " output=" + (parsed.usage?.outputTokens ?? 0),
+      status: "completed",
+      createdAt: new Date().toISOString(),
+    });
   }
-  if (event.type === "item.started" && event.item && typeof event.item === "object") {
-  const item = event.item as Record<string, unknown>;
-  if (item.type === "command_execution" && typeof item.command === "string") {
-    if (isCommandRisky(item.command)) {
-      parsed.blockedCommand = item.command;
-    }
-  }
-}
+
   if (event.type === "error") {
     const message =
       typeof event.message === "string"
@@ -168,7 +215,8 @@ export class CodexRunner implements AgentRunner {
       threadId: request.threadId,
       usage: null,
       errors: [],
-      blockedCommand: null, // NEW
+      blockedCommand: null,
+      spans: [],
     };
     let stdout = "";
     let stderr = "";
@@ -182,17 +230,17 @@ export class CodexRunner implements AgentRunner {
         return;
       }
       if (target === "stdout") {
-  stdout += chunk.toString("utf8");
-  const lines = stdout.split(/\r?\n/);
-  stdout = lines.pop() ?? "";
-  for (const line of lines) {
-    parseCodexEventLine(line, parsed);
-    if (parsed.blockedCommand && !active.cancelled) {
-      active.cancelled = true; // reuse existing cancellation flag
-      this.terminate(active);
-    }
-  }
-}   else {
+        stdout += chunk.toString("utf8");
+        const lines = stdout.split(/\r?\n/);
+        stdout = lines.pop() ?? "";
+        for (const line of lines) {
+          parseCodexEventLine(line, parsed);
+          if (parsed.blockedCommand && !active.cancelled) {
+            active.cancelled = true;
+            this.terminate(active);
+          }
+        }
+      } else {
         stderr += chunk.toString("utf8");
         if (stderr.length > 16_384) {
           stderr = stderr.slice(-16_384);
@@ -219,28 +267,35 @@ export class CodexRunner implements AgentRunner {
       }
       if (active.cancelled) {
         if (parsed.blockedCommand) {
-          throw new Error("Blocked risky command mid-execution: " + parsed.blockedCommand);
+          throw new CodexRunError(
+            "Blocked risky command mid-execution: " + parsed.blockedCommand,
+            parsed.spans,
+          );
         }
         throw new RunCancelledError();
       }
       if (active.timedOut) {
-        throw new Error("Codex timed out after " + this.config.codexTimeoutMs + " ms");
+        throw new CodexRunError(
+          "Codex timed out after " + this.config.codexTimeoutMs + " ms",
+          parsed.spans,
+        );
       }
       if (active.outputExceeded) {
-        throw new Error("Codex output exceeded CODEX_MAX_OUTPUT_BYTES");
+        throw new CodexRunError("Codex output exceeded CODEX_MAX_OUTPUT_BYTES", parsed.spans);
       }
       if (exitCode !== 0) {
         const detail = parsed.errors.at(-1) ?? stderr.trim() ?? "No error detail";
-        throw new Error("Codex exited with code " + exitCode + ": " + detail);
+        throw new CodexRunError("Codex exited with code " + exitCode + ": " + detail, parsed.spans);
       }
       const output = parsed.messages.at(-1)?.trim();
       if (!output) {
-        throw new Error("Codex completed without an agent message");
+        throw new CodexRunError("Codex completed without an agent message", parsed.spans);
       }
       return {
         output,
         threadId: parsed.threadId,
         usage: parsed.usage,
+        spans: parsed.spans,
       };
     } finally {
       clearTimeout(timeout);

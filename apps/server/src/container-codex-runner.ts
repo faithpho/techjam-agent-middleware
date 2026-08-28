@@ -8,8 +8,8 @@ import type {
   RunUsage,
   RunnerRequest,
   RunnerResult,
+  RunSpan,
 } from "./types.js";
-
 const execFileAsync = promisify(execFile);
 
 interface ActiveContainer {
@@ -27,6 +27,7 @@ interface ParsedEvents {
   threadId: string | null;
   usage: RunUsage | null;
   errors: string[];
+  spans: RunSpan[];
   blockedCommand: string | null; // NEW
 }
 
@@ -172,6 +173,7 @@ export class ContainerCodexRunner implements AgentRunner {
       threadId: request.threadId,
       usage: null,
       errors: [],
+      spans: [],
       blockedCommand: null, // NEW — add this line
     };
     let stdout = "";
@@ -230,7 +232,7 @@ export class ContainerCodexRunner implements AgentRunner {
       }
       const output = parsed.messages.at(-1)?.trim();
       if (!output) throw new Error("Codex completed without an agent message");
-      return { output, threadId: parsed.threadId, usage: parsed.usage };
+      return { output, threadId: parsed.threadId, usage: parsed.usage, spans: parsed.spans };
     } finally {
       clearTimeout(timeout);
       this.active.delete(request.agentId);

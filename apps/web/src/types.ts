@@ -7,7 +7,20 @@ export type RunStatus =
   | "cancelled"
   | "pending_approval"
   | "denied";
+export type SpanCategory =
+  | "policy_decision"
+  | "human_approval"
+  | "tool_call"
+  | "model_call";
 
+export interface RunSpan {
+  id: string;
+  category: SpanCategory;
+  label: string;
+  detail: string | null;
+  status: "completed" | "blocked" | "failed" | "in_progress";
+  createdAt: string;
+}
 export interface Agent {
   id: string;
   name: string;
@@ -19,6 +32,7 @@ export interface Agent {
   lastError: string | null;
   createdAt: string;
   updatedAt: string;
+  ownerId: string;
 }
 
 export interface Message {
@@ -44,6 +58,9 @@ export interface AgentRun {
   } | null;
   createdAt: string;
   riskReason?: string | null;
+  spans: RunSpan[];
+  model: string | null;        // NEW
+  runtimeProvider: string | null; // NEW
 }
 
 export interface SystemInfo {

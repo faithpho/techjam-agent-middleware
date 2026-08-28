@@ -35,16 +35,18 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 export const api = {
   auth: () => request<{ required: boolean }>("/api/auth"),
   system: () => request<SystemInfo>("/api/system"),
-  listAgents: () => request<{ agents: Agent[] }>("/api/agents"),
+  listAgents: (ownerId: string) =>
+  request<{ agents: Agent[] }>("/api/agents?ownerId=" + encodeURIComponent(ownerId)),
   createAgent: (body: {
-    name: string;
-    description: string;
-    instructions: string;
-  }) =>
-    request<{ agent: Agent }>("/api/agents", {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
+  name: string;
+  description: string;
+  instructions: string;
+  ownerId: string;
+}) =>
+  request<{ agent: Agent }>("/api/agents", {
+    method: "POST",
+    body: JSON.stringify(body),
+  }),
   updateAgent: (
     id: string,
     body: { name: string; description: string; instructions: string },
@@ -53,10 +55,11 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(body),
     }),
-  deleteAgent: (id: string) =>
-    request<{ archivedWorkspace: string }>("/api/agents/" + id, {
-      method: "DELETE",
-    }),
+  deleteAgent: (id: string, requesterId: string) =>
+  request<{ archivedWorkspace: string }>(
+    "/api/agents/" + id + "?requesterId=" + encodeURIComponent(requesterId),
+    { method: "DELETE" },
+  ),
   startAgent: (id: string) =>
     request<{ agent: Agent }>("/api/agents/" + id + "/start", {
       method: "POST",
@@ -69,21 +72,23 @@ export const api = {
     request<{ messages: Message[] }>("/api/agents/" + id + "/messages"),
   runs: (id: string) =>
     request<{ runs: AgentRun[] }>("/api/agents/" + id + "/runs"),
-  sendMessage: (id: string, content: string) =>
-    request<{ run: AgentRun; message: Message }>(
-      "/api/agents/" + id + "/messages",
-      {
-        method: "POST",
-        body: JSON.stringify({ content }),
-      },
-    ),
+  sendMessage: (id: string, content: string, requesterId: string) =>
+  request<{ run: AgentRun; message: Message }>(
+    "/api/agents/" + id + "/messages",
+    {
+      method: "POST",
+      body: JSON.stringify({ content, requesterId }),
+    },
+  ),
   run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
-  approveRun: (id: string) =>
-    request<{ ok: boolean }>("/api/runs/" + id + "/approve", {
-      method: "POST",
-    }),
-  denyRun: (id: string) =>
-    request<{ ok: boolean }>("/api/runs/" + id + "/deny", {
-      method: "POST",
-    }),
+  approveRun: (id: string, operatorName?: string, requesterId?: string) =>
+  request<{ ok: boolean }>("/api/runs/" + id + "/approve", {
+    method: "POST",
+    body: JSON.stringify({ operatorName, requesterId }),
+  }),
+denyRun: (id: string, operatorName?: string, requesterId?: string) =>
+  request<{ ok: boolean }>("/api/runs/" + id + "/deny", {
+    method: "POST",
+    body: JSON.stringify({ operatorName, requesterId }),
+  }),
 };

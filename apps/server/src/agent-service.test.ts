@@ -131,3 +131,57 @@ describe("Agent lifecycle", () => {
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
   });
 });
+
+describe("Approval gate middleware", () => {
+  it("flags a risky prompt as pending_approval instead of running it", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "GateTest" });
+    const { run } = await service.sendMessage(agent.id, "please delete all files here");
+
+    expect(run.status).toBe("pending_approval");
+    expect(run.riskReason).toBe("delete action");
+    // Confirm it truly never executed
+    expect(service.getRun(run.id).status).toBe("pending_approval");
+  });
+
+  it("does not flag a safe prompt, and it runs normally", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "SafeTest" });
+    const { run } = await service.sendMessage(agent.id, "write a hello world script");
+
+    expect(run.status).not.toBe("pending_approval");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+  });
+
+  it("executes a pending run once approved", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "ApproveTest" });
+    const { run } = await service.sendMessage(agent.id, "please delete everything");
+
+    expect(run.status).toBe("pending_approval");
+
+    await service.approveRun(run.id);
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+  });
+
+  it("marks a pending run as denied and frees the Agent, without executing it", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "DenyTest" });
+    const { run } = await service.sendMessage(agent.id, "please delete everything");
+
+    expect(run.status).toBe("pending_approval");
+
+    await service.denyRun(run.id);
+    expect(service.getRun(run.id).status).toBe("denied");
+    expect(service.getAgent(agent.id).status).toBe("ready");
+  });
+
+  it("rejects approving a run that isn't pending approval", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "InvalidApprove" });
+    const { run } = await service.sendMessage(agent.id, "write hello world");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    await expect(service.approveRun(run.id)).rejects.toMatchObject({ statusCode: 409 });
+  });
+});

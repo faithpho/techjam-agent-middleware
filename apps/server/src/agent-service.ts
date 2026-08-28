@@ -10,8 +10,10 @@ import type {
   CreateAgentInput,
   Message,
   UpdateAgentInput,
+  RunSpan,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
+import { CodexRunError } from "./codex-runner.js";
 
 const now = () => new Date().toISOString();
 
@@ -46,18 +48,25 @@ export class AgentService {
     });
   }
 
-  listAgents(): Agent[] {
-    return this.store
-      .snapshot()
-      .agents.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-  }
+  listAgents(ownerId?: string): Agent[] {
+  const all = this.store
+    .snapshot()
+    .agents.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  return ownerId ? all.filter((agent) => agent.ownerId === ownerId) : all;
+}
 
   getAgent(id: string): Agent {
     const agent = this.store.snapshot().agents.find((item) => item.id === id);
     if (!agent) {
-      throw new HttpError(404, " Agent not found");
+      throw new HttpError(404, "Agent not found");
     }
     return agent;
+  }
+
+  private assertOwner(agent: Agent, requesterId: string): void {
+    if (agent.ownerId !== requesterId) {
+      throw new HttpError(403, "You do not own this Agent");
+    }
   }
 
   async createAgent(input: CreateAgentInput): Promise<Agent> {
@@ -74,6 +83,7 @@ export class AgentService {
       lastError: null,
       createdAt: timestamp,
       updatedAt: timestamp,
+      ownerId: input.ownerId,
     };
     await this.workspaces.create(agent);
     await this.store.mutate((database) => database.agents.push(agent));
@@ -104,8 +114,9 @@ export class AgentService {
     return updated;
   }
 
-  async deleteAgent(id: string): Promise<{ archivedWorkspace: string }> {
+  async deleteAgent(id: string, requesterId?: string): Promise<{ archivedWorkspace: string }> {
     const agent = this.getAgent(id);
+    if (requesterId) this.assertOwner(agent, requesterId);
     await this.cancelExecution(id);
     const archivedWorkspace = await this.workspaces.archive(agent);
     await this.store.mutate((database) => {
@@ -125,35 +136,62 @@ export class AgentService {
     await this.cancelExecution(id);
     return this.setStatus(id, "stopped");
   }
-  // ---- NEW: approve/deny methods go here ----
-  async approveRun(runId: string): Promise<void> {
-  const run = this.getRun(runId);
-  if (run.status !== "pending_approval") {
-    throw new HttpError(409, "This run is not pending approval");
-  }
-  const agent = this.getAgent(run.agentId);
-  const execution = this.executeRun(agent, run);
-  this.activeExecutions.set(agent.id, execution);
-  void execution.finally(() => {
-    if (this.activeExecutions.get(agent.id) === execution) {
-      this.activeExecutions.delete(agent.id);
+
+  async approveRun(runId: string, operatorName?: string, requesterId?: string): Promise<void> {
+    const run = this.getRun(runId);
+    if (run.status !== "pending_approval") {
+      throw new HttpError(409, "This run is not pending approval");
     }
-  }).catch(() => undefined);
-}
-  async denyRun(runId: string): Promise<void> {
+    const agent = this.getAgent(run.agentId);
+    if (requesterId) this.assertOwner(agent, requesterId);
+    const who = operatorName?.trim() || "unknown operator";
+    await this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === runId);
+      if (storedRun) {
+        storedRun.spans = [...(storedRun.spans ?? []), {
+          id: randomUUID(),
+          category: "human_approval",
+          label: "Human decision",
+          detail: "Approved by " + who,
+          status: "completed",
+          createdAt: now(),
+        }];
+      }
+    });
+    const execution = this.executeRun(agent, run);
+    this.activeExecutions.set(agent.id, execution);
+    void execution.finally(() => {
+      if (this.activeExecutions.get(agent.id) === execution) {
+        this.activeExecutions.delete(agent.id);
+      }
+    }).catch(() => undefined);
+  }
+
+  async denyRun(runId: string, operatorName?: string, requesterId?: string): Promise<void> {
+    const run = this.getRun(runId);
+    if (requesterId) {
+      const agent = this.getAgent(run.agentId);
+      this.assertOwner(agent, requesterId);
+    }
+    const who = operatorName?.trim() || "unknown operator";
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === runId);
       const agent = database.agents.find((item) => item.id === storedRun?.agentId);
       if (storedRun) {
         storedRun.status = "denied";
         storedRun.completedAt = now();
+        storedRun.spans = [...(storedRun.spans ?? []), {
+          id: randomUUID(),
+          category: "human_approval",
+          label: "Human decision",
+          detail: "Denied by " + who,
+          status: "blocked",
+          createdAt: now(),
+        }];
       }
-      if (agent) {
-        agent.status = "ready";
-      }
+      if (agent) agent.status = "ready";
     });
   }
-  // ---- end new methods ----
 
   getMessages(agentId: string): Message[] {
     this.getAgent(agentId);
@@ -182,6 +220,7 @@ export class AgentService {
   async sendMessage(
     agentId: string,
     prompt: string,
+    requesterId: string,
   ): Promise<{ run: AgentRun; message: Message }> {
     if (!isArkConfigured(this.config)) {
       throw new HttpError(
@@ -189,6 +228,9 @@ export class AgentService {
         "Ark is not configured. Set ARK_API_KEY and ARK_MODEL, then restart.",
       );
     }
+    const agentCheck = this.getAgent(agentId);
+    this.assertOwner(agentCheck, requesterId);
+
     const timestamp = now();
     const runId = randomUUID();
     const run: AgentRun = {
@@ -202,6 +244,9 @@ export class AgentService {
       startedAt: null,
       completedAt: null,
       createdAt: timestamp,
+      spans: [],
+      model: this.config.arkModel || null,
+      runtimeProvider: this.config.runtimeProvider || null,
     };
     const message: Message = {
       id: randomUUID(),
@@ -230,20 +275,37 @@ export class AgentService {
       storedAgent.updatedAt = timestamp;
       return snapshot;
     });
-    // NEW: check risk before running
+
     const riskReason = this.getRiskReason(run.prompt);
+    const policySpan: RunSpan = {
+      id: randomUUID(),
+      category: "policy_decision",
+      label: "Prompt risk check",
+      detail: riskReason ?? "No risky pattern matched — auto-allowed",
+      status: riskReason ? "blocked" : "completed",
+      createdAt: now(),
+    };
     if (riskReason) {
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         if (storedRun) {
-          storedRun.status = "pending_approval";  // new status
+          storedRun.status = "pending_approval";
           storedRun.riskReason = riskReason;
+          storedRun.spans = [...(storedRun.spans ?? []), policySpan];
         }
       });
-      run.status = "pending_approval"; // NEW: fix the local copy too
-      run.riskReason = riskReason;      // NEW
-      return { run, message }; // stop here — do NOT call executeRun yet
+      run.status = "pending_approval";
+      run.riskReason = riskReason;
+      run.spans = [policySpan];
+      return { run, message };
     }
+
+    await this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === run.id);
+      if (storedRun) storedRun.spans = [...(storedRun.spans ?? []), policySpan];
+    });
+    run.spans = [policySpan];
+
     const execution = this.executeRun(agentAtStart, run);
     this.activeExecutions.set(agentId, execution);
     void execution
@@ -302,6 +364,7 @@ export class AgentService {
         storedRun.output = result.output;
         storedRun.usage = result.usage;
         storedRun.completedAt = completedAt;
+        storedRun.spans = [...(storedRun.spans ?? []), ...(result.spans ?? [])];
         database.messages.push({
           id: randomUUID(),
           agentId: agent.id,
@@ -319,6 +382,7 @@ export class AgentService {
       const completedAt = now();
       const cancelled = error instanceof RunCancelledError;
       const message = error instanceof Error ? error.message : String(error);
+      const extraSpans = error instanceof CodexRunError ? error.spans : [];
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
@@ -326,6 +390,7 @@ export class AgentService {
           storedRun.status = cancelled ? "cancelled" : "failed";
           storedRun.error = message;
           storedRun.completedAt = completedAt;
+          storedRun.spans = [...(storedRun.spans ?? []), ...extraSpans];
         }
         if (agent) {
           if (agent.status !== "stopped") {
@@ -366,18 +431,17 @@ export class AgentService {
       this.cancellationRequests.delete(agentId);
     }
   }
-  // ---- NEW: risk-check helper goes here ----
-  private getRiskReason(prompt: string): string | null {
-  const riskyPatterns: Array<{ pattern: RegExp; label: string }> = [
-    { pattern: /rm\s+-rf/i, label: "destructive shell command (rm -rf)" },
-    { pattern: /delete/i, label: "delete action" },
-    { pattern: /drop\s+table/i, label: "database drop command" },
-    { pattern: /\.env/i, label: "environment/secrets file access" },
-    { pattern: /credentials/i, label: "credentials reference" },
-    { pattern: /secret/i, label: "secret reference" },
-  ];
-  const match = riskyPatterns.find(({ pattern }) => pattern.test(prompt));
-  return match ? match.label : null;
-}
-} // <- this is the class's final closing brace
 
+  private getRiskReason(prompt: string): string | null {
+    const riskyPatterns: Array<{ pattern: RegExp; label: string }> = [
+      { pattern: /rm\s+-rf/i, label: "destructive shell command (rm -rf)" },
+      { pattern: /delete/i, label: "delete action" },
+      { pattern: /drop\s+table/i, label: "database drop command" },
+      { pattern: /\.env/i, label: "environment/secrets file access" },
+      { pattern: /credentials/i, label: "credentials reference" },
+      { pattern: /secret/i, label: "secret reference" },
+    ];
+    const match = riskyPatterns.find(({ pattern }) => pattern.test(prompt));
+    return match ? match.label : null;
+  }
+}

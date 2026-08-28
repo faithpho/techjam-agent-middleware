@@ -14,6 +14,7 @@ const createAgentBody = z.object({
   name: z.string().trim().min(1).max(80),
   description: z.string().max(500).optional(),
   instructions: z.string().max(10_000).optional(),
+  ownerId: z.string().trim().min(1).max(100),
 });
 const updateAgentBody = createAgentBody.partial().refine(
   (value) => Object.keys(value).length > 0,
@@ -21,7 +22,13 @@ const updateAgentBody = createAgentBody.partial().refine(
 );
 const messageBody = z.object({
   content: z.string().trim().min(1).max(50_000),
+  requesterId: z.string().trim().min(1).max(100),
 });
+const approvalBody = z.object({
+  operatorName: z.string().trim().min(1).max(100).optional(),
+  requesterId: z.string().trim().min(1).max(100).optional(),
+});
+const withOwnerBody = z.object({ ownerId: z.string().trim().min(1).max(100) });
 
 export async function createApp(
   config: AppConfig,
@@ -72,7 +79,10 @@ export async function createApp(
 
   app.get("/api/system", async () => service.systemInfo());
 
-  app.get("/api/agents", async () => ({ agents: service.listAgents() }));
+  app.get("/api/agents", async (request) => {
+  const ownerId = (request.query as { ownerId?: string }).ownerId;
+  return { agents: service.listAgents(ownerId) };
+});
 
   app.post("/api/agents", async (request, reply) => {
     const body = createAgentBody.parse(request.body);
@@ -92,9 +102,10 @@ export async function createApp(
   });
 
   app.delete("/api/agents/:id", async (request) => {
-    const { id } = agentIdParams.parse(request.params);
-    return service.deleteAgent(id);
-  });
+  const { id } = agentIdParams.parse(request.params);
+  const requesterId = (request.query as { requesterId?: string }).requesterId;
+  return service.deleteAgent(id, requesterId);
+});
 
   app.post("/api/agents/:id/start", async (request) => {
     const { id } = agentIdParams.parse(request.params);
@@ -117,29 +128,30 @@ export async function createApp(
   });
 
   app.post("/api/agents/:id/messages", async (request, reply) => {
-    const { id } = agentIdParams.parse(request.params);
-    const body = messageBody.parse(request.body);
-    const result = await service.sendMessage(id, body.content);
-    return reply.code(202).send(result);
-  });
+  const { id } = agentIdParams.parse(request.params);
+  const body = messageBody.parse(request.body);
+  const result = await service.sendMessage(id, body.content, body.requesterId);
+  return reply.code(202).send(result);
+});
 
   app.get("/api/runs/:id", async (request) => {
     const { id } = runIdParams.parse(request.params);
-    return { run: service.getRun(id) };
+    return { run: service.getRun(id)};
   });
   
   app.post("/api/runs/:id/approve", async (request, reply) => {
-    const { id } = runIdParams.parse(request.params);
-    await service.approveRun(id);
-    reply.send({ ok: true });
-  });
+  const { id } = runIdParams.parse(request.params);
+  const body = approvalBody.parse(request.body ?? {});
+  await service.approveRun(id, body.operatorName, body.requesterId);
+  reply.send({ ok: true });
+});
 
-  app.post("/api/runs/:id/deny", async (request, reply) => {
-    const { id } = runIdParams.parse(request.params);
-    await service.denyRun(id);
-    reply.send({ ok: true });
-  });
-
+app.post("/api/runs/:id/deny", async (request, reply) => {
+  const { id } = runIdParams.parse(request.params);
+  const body = approvalBody.parse(request.body ?? {});
+  await service.denyRun(id, body.operatorName, body.requesterId);
+  reply.send({ ok: true });
+});
   if (config.nodeEnv === "production") {
     const webRoot = fileURLToPath(new URL("../../web/dist", import.meta.url));
     await app.register(fastifyStatic, {

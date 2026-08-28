@@ -9,6 +9,21 @@ export type RunStatus =
   | "denied";
 export type MessageRole = "user" | "assistant";
 
+export type SpanCategory =
+  | "policy_decision"
+  | "human_approval"
+  | "tool_call"
+  | "model_call";
+
+export interface RunSpan {
+  id: string;
+  category: SpanCategory;
+  label: string;
+  detail: string | null;
+  status: "completed" | "blocked" | "failed" | "in_progress";
+  createdAt: string;
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -20,6 +35,7 @@ export interface Agent {
   lastError: string | null;
   createdAt: string;
   updatedAt: string;
+  ownerId: string;
 }
 
 export interface Message {
@@ -44,11 +60,18 @@ export interface AgentRun {
   prompt: string;
   output: string | null;
   error: string | null;
-  usage: RunUsage | null;
+  usage: {
+    inputTokens?: number;
+    cachedInputTokens?: number;
+    outputTokens?: number;
+  } | null;
   startedAt: string | null;
   completedAt: string | null;
   createdAt: string;
-  riskReason?: string | null; // NEW: why this run was flagged, if it was
+  riskReason?: string | null;
+  spans: RunSpan[];
+  model: string | null;        // NEW
+  runtimeProvider: string | null; // NEW
 }
 
 export interface Database {
@@ -62,6 +85,7 @@ export interface CreateAgentInput {
   name: string;
   description?: string | undefined;
   instructions?: string | undefined;
+  ownerId: string;
 }
 
 export interface UpdateAgentInput {
@@ -74,6 +98,7 @@ export interface RunnerResult {
   output: string;
   threadId: string | null;
   usage: RunUsage | null;
+  spans?: RunSpan[];
 }
 
 export interface RunnerRequest {
@@ -88,3 +113,4 @@ export interface AgentRunner {
   cancel(agentId: string): Promise<boolean>;
   isAvailable(): Promise<boolean>;
 }
+

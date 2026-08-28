@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
 import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -42,6 +42,8 @@ export default function App() {
   const [system, setSystem] = useState<SystemInfo | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showAuditLog, setShowAuditLog] = useState(false);
+  const [auditRuns, setAuditRuns] = useState<AgentRun[]>([]);
   const [form, setForm] = useState(emptyForm);
   const [prompt, setPrompt] = useState("");
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
@@ -53,22 +55,26 @@ export default function App() {
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
   const pollingRunIds = useRef(new Set<string>());
+  const [operatorName, setOperatorName] = useState("");
+  const [ownerId, setOwnerId] = useState<string | null>(null);
+  const [ownerInput, setOwnerInput] = useState("");
   selectedIdRef.current = selectedId;
-
+  
   const selected = useMemo(
     () => agents.find((agent) => agent.id === selectedId) ?? null,
     [agents, selectedId],
   );
 
   const refreshAgents = useCallback(async () => {
-    const { agents: next } = await api.listAgents();
+  if (!ownerId) return;
+  const { agents: next } = await api.listAgents(ownerId);
     setAgents(next);
     setSelectedId((current) =>
       current && next.some((agent) => agent.id === current)
         ? current
         : (next[0]?.id ?? null),
     );
-  }, []);
+  }, [ownerId]);
 
   const refreshMessages = useCallback(async (agentId: string) => {
     const result = await api.messages(agentId);
@@ -82,27 +88,39 @@ export default function App() {
   }, [refreshAgents]);
 
   useEffect(() => {
-    mountedRef.current = true;
-    void api
-      .auth()
-      .then(async ({ required }) => {
-        if (!mountedRef.current) return;
-        setAuthRequired(required);
-        if (!required) await bootstrap();
-      })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
-    return () => {
-      mountedRef.current = false;
-    };
-  }, [bootstrap]);
+  mountedRef.current = true;
+  void api
+    .auth()
+    .then(async ({ required }) => {
+      if (!mountedRef.current) return;
+      setAuthRequired(required);
+      if (!required) await bootstrap();
+    })
+    .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+  return () => {
+    mountedRef.current = false;
+  };
+}, [bootstrap]);
 
-  useEffect(() => {
-    setActiveRun(null);
-    setShowSettings(false);
-    if (!selectedId) {
+useEffect(() => {
+  if (ownerId) {
+    void bootstrap();
+  }
+}, [ownerId, bootstrap]);
+
+useEffect(() => {
+  setActiveRun(null);
+  setShowSettings(false);
+  if (!selectedId) {
       setMessages([]);
+      setShowAuditLog(false);
+      setAuditRuns([]);
       return;
     }
+    // NEW: if audit log is currently open, refresh it for the newly selected agent
+    if (showAuditLog) {
+      void api.runs(selectedId).then((result) => setAuditRuns(result.runs)).catch(() => undefined);
+    } 
     void Promise.all([refreshMessages(selectedId), api.runs(selectedId)])
       .then(([, result]) => {
         if (selectedIdRef.current !== selectedId) return;
@@ -138,7 +156,7 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      const { agent } = await api.createAgent(form);
+      const { agent } = await api.createAgent({ ...form, ownerId: ownerId! });
       await refreshAgents();
       setSelectedId(agent.id);
       setShowCreate(false);
@@ -183,7 +201,16 @@ export default function App() {
       setBusy(false);
     }
   };
-
+  const loadAuditLog = async () => {
+    if (!selected) return;
+    try {
+      const result = await api.runs(selected.id);
+      setAuditRuns(result.runs);
+      setShowAuditLog(true);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
   const deleteAgent = async () => {
     if (!selected) return;
     if (!window.confirm("Delete " + selected.name + "? Its workspace will be archived.")) {
@@ -192,7 +219,7 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      await api.deleteAgent(selected.id);
+      await api.deleteAgent(selected.id, ownerId!);
       await refreshAgents();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -202,30 +229,36 @@ export default function App() {
   };
 
   const pollRun = async (runId: string, agentId: string) => {
-    if (pollingRunIds.current.has(runId)) return;
-    pollingRunIds.current.add(runId);
-    try {
-      while (mountedRef.current) {
-        await new Promise((resolve) => window.setTimeout(resolve, 900));
-        if (!mountedRef.current) return;
-        const result = await api.run(runId);
-        if (selectedIdRef.current === agentId) setActiveRun(result.run);
-        if (!["queued", "running"].includes(result.run.status)) {
-          await Promise.all([refreshMessages(agentId), refreshAgents()]);
-          return;
+  if (pollingRunIds.current.has(runId)) return;
+  pollingRunIds.current.add(runId);
+  try {
+    while (mountedRef.current) {
+      await new Promise((resolve) => window.setTimeout(resolve, 900));
+      if (!mountedRef.current) return;
+      const result = await api.run(runId);
+      if (selectedIdRef.current === agentId) setActiveRun(result.run);
+      if (!["queued", "running"].includes(result.run.status)) {
+        await Promise.all([refreshMessages(agentId), refreshAgents()]);
+        if (showAuditLog && selectedIdRef.current === agentId) {
+          const auditResult = await api.runs(agentId);
+          setAuditRuns(auditResult.runs);
         }
+        return;
       }
-    } finally {
-      pollingRunIds.current.delete(runId);
     }
-  };
+  } finally {
+    pollingRunIds.current.delete(runId);
+  }
+};
 
   const approveRun = async (runId: string) => {
     if (!selected) return;
+    const name = window.prompt("Your name (for the audit record):", operatorName) || "unknown operator";
+    setOperatorName(name);
     setBusy(true);
     setError(null);
     try {
-      await api.approveRun(runId);
+      await api.approveRun(runId, name, ownerId!);
       setAgents((current) =>
         current.map((agent) =>
           agent.id === selected.id ? { ...agent, status: "busy" } : agent,
@@ -241,10 +274,12 @@ export default function App() {
 
   const denyRun = async (runId: string) => {
     if (!selected) return;
+    const name = window.prompt("Your name (for the audit record):", operatorName) || "unknown operator";
+    setOperatorName(name);
     setBusy(true);
     setError(null);
     try {
-      await api.denyRun(runId);
+      await api.denyRun(runId, name, ownerId!);
       setActiveRun(null);
       await refreshAgents();
     } catch (reason) {
@@ -260,7 +295,7 @@ export default function App() {
     setPrompt("");
     setError(null);
     try {
-      const result = await api.sendMessage(selected.id, content);
+      const result = await api.sendMessage(selected.id, content, ownerId!);
       if (selectedIdRef.current === selected.id) {
         setMessages((current) => [...current, result.message]);
         setActiveRun(result.run);
@@ -273,7 +308,6 @@ export default function App() {
         );
         await pollRun(result.run.id, selected.id);
       }
-      await pollRun(result.run.id, selected.id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       setActiveRun(null);
@@ -341,7 +375,36 @@ export default function App() {
       </main>
     );
   }
-
+  if (!ownerId) {
+  return (
+    <main className="auth-screen">
+      <form
+        className="auth-card"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (ownerInput.trim()) setOwnerId(ownerInput.trim());
+        }}
+      >
+        <div className="brand-mark">A</div>
+        <span className="eyebrow">Agent Launchpad</span>
+        <h1>Who are you?</h1>
+        <p>This identifies you as the owner of Agents you create (demo-only, not real authentication).</p>
+        <label>
+          Your name
+          <input
+            autoFocus
+            value={ownerInput}
+            onChange={(event) => setOwnerInput(event.target.value)}
+            required
+          />
+        </label>
+        <button className="button button-primary" disabled={!ownerInput.trim()}>
+          Continue
+        </button>
+      </form>
+    </main>
+  );
+}
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -441,6 +504,12 @@ export default function App() {
               <div className="header-actions">
                 <button
                   className="button button-ghost"
+                  onClick={loadAuditLog}
+                >
+                  Audit Log
+                </button>
+                <button
+                  className="button button-ghost"
                   onClick={() => setShowSettings((value) => !value)}
                   disabled={busy || selected.status === "busy"}
                 >
@@ -513,6 +582,98 @@ export default function App() {
               </form>
             )}
 
+                        {showAuditLog && selected && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            right: 0,
+            width: "440px",
+            minWidth: "320px",
+            maxWidth: "800px",
+            height: "100vh",
+            background: "#fff",
+            borderLeft: "1px solid #ddd",
+            boxShadow: "-4px 0 12px rgba(0,0,0,0.08)",
+            zIndex: 50,
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
+          <div
+            style={{
+              padding: "16px",
+              borderBottom: "1px solid #ddd",
+              flexShrink: 0,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "flex-start",
+              background: "#fff",
+            }}
+          >
+            <div>
+              <div style={{ fontSize: "11px", textTransform: "uppercase", color: "#888", letterSpacing: "0.5px", marginBottom: "4px" }}>
+                Middleware
+              </div>
+              <h2 style={{ margin: 0, fontSize: "18px" }}>Audit Log — {selected.name}</h2>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowAuditLog(false)}
+              style={{ background: "none", border: "none", fontSize: "20px", cursor: "pointer", lineHeight: 1 }}
+            >
+              ×
+            </button>
+          </div>
+          <div style={{ overflowY: "auto", flexGrow: 1, padding: "16px" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ textAlign: "left", borderBottom: "1px solid #ddd", position: "sticky", top: 0, zIndex: 10, background: "#f5f5f5", isolation: "isolate" }}>
+                  <th style={{ padding: "8px", position: "sticky", top: 0, background: "#fff", zIndex: 10 }}>Time</th>
+                  <th style={{ padding: "8px", position: "sticky", top: 0, background: "#fff", zIndex: 10 }}>Status</th>
+                  <th style={{ padding: "8px", position: "sticky", top: 0, background: "#fff", zIndex: 10 }}>Reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {auditRuns.map((run) => (
+                  <React.Fragment key={run.id}>
+                    <tr style={{ borderBottom: "1px solid #eee" }}>
+                      <td style={{ padding: "8px" }}>{formatTime(run.createdAt)}</td>
+                      <td style={{ padding: "8px" }}>
+                        <span className={"status status-" + run.status}>{run.status}</span>
+                      </td>
+                      <td style={{ padding: "8px", color: "#a33", fontSize: "12px" }}>
+                        {run.riskReason ?? "—"}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td colSpan={3} style={{ padding: "0 8px 6px 8px", fontSize: "11px", color: "#888" }}>
+                        {run.prompt}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td colSpan={3} style={{ padding: "0 8px 6px 8px", fontSize: "10px", color: "#aaa" }}>
+                        {run.model ?? "unknown model"} · {run.runtimeProvider ?? "unknown runtime"}
+                      </td>
+                    </tr>
+                    {run.spans && run.spans.length > 0 && (
+                      <tr>
+                        <td colSpan={3} style={{ padding: "4px 8px 12px 12px", background: "#fafafa" }}>
+                          {run.spans.map((span) => (
+                            <div key={span.id} style={{ fontSize: "11px", color: "#555", padding: "2px 0" }}>
+                              <strong>[{span.category}]</strong> {span.status} — {span.detail}
+                            </div>
+                          ))}
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
             <section className="playground">
               <div className="playground-topbar">
                 <div>
